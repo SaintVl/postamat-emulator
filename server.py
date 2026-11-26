@@ -1,4 +1,4 @@
-"""Serve a different simulated parcel locker journal on every GET /logs."""
+"""Учебный эмулятор постамата."""
 
 from contextlib import closing
 from datetime import datetime, time, timedelta, timezone
@@ -8,23 +8,56 @@ from random import Random
 import sqlite3
 from urllib.parse import urlsplit
 
+
 PORT = 8000
 STATE_FILE = Path(__file__).with_name(".postamat-state.sqlite3")
+EVENTS_PER_JOURNAL = 100
 
-CONFIRMED = "DOOR_OPEN_CONFIRMED"
-TIMEOUT = "OPEN_CONFIRMATION_TIMEOUT"
+CODE_REJECTED = ("CODE_REJECTED",)
+CODE_ACCEPTED = ("CODE_ACCEPTED",)
+COMMAND_SENT = (*CODE_ACCEPTED, "OPEN_COMMAND_SENT")
+CANCELLED = (*CODE_ACCEPTED, "PICKUP_CANCELLED")
+COMMAND_FAILED = (*CODE_ACCEPTED, "OPEN_COMMAND_FAILED")
+DOOR_FAILED = (*COMMAND_SENT, "DOOR_OPEN_FAILED")
+TIMED_OUT = (*COMMAND_SENT, "OPEN_CONFIRMATION_TIMEOUT")
+OPENED = (*COMMAND_SENT, "DOOR_OPEN_CONFIRMED")
+CLOSED = (*OPENED, "PARCEL_REMOVED", "DOOR_CLOSED_CONFIRMED")
+LEFT_OPEN = (*OPENED, "DOOR_LEFT_OPEN")
+CLOSED_LATE = (*LEFT_OPEN, "PARCEL_REMOVED", "DOOR_CLOSED_CONFIRMED")
 
-# Each tuple describes the outcomes of successive attempts on one order.
-# None means the journal ends without a final event for that attempt.
-SCENARIOS = (
-    (CONFIRMED,),
-    (TIMEOUT,),
-    (None,),
-    (TIMEOUT, CONFIRMED),
-    (TIMEOUT, TIMEOUT),
-    (TIMEOUT, None),
-    (TIMEOUT, TIMEOUT, CONFIRMED),
+# Каждый заказ содержит одну или несколько попыток выдачи.
+REQUIRED_ORDERS = (
+    (CODE_REJECTED, TIMED_OUT, CLOSED_LATE),
+    (CANCELLED,),
+    (COMMAND_FAILED,),
+    (DOOR_FAILED,),
+    (COMMAND_SENT,),
+    (LEFT_OPEN,),
 )
+
+RANDOM_ORDERS = (
+    (CODE_REJECTED,),
+    (CANCELLED,),
+    (COMMAND_FAILED,),
+    (COMMAND_SENT,),
+    (DOOR_FAILED,),
+    (TIMED_OUT,),
+    (OPENED,),
+    (CLOSED,),
+    (LEFT_OPEN,),
+    (CLOSED_LATE,),
+    (CODE_REJECTED, OPENED),
+    (TIMED_OUT, CLOSED),
+    (TIMED_OUT, TIMED_OUT),
+    (TIMED_OUT, COMMAND_SENT),
+    (TIMED_OUT, DOOR_FAILED, CLOSED),
+)
+
+EVENT_DELAY_SECONDS = {
+    "OPEN_CONFIRMATION_TIMEOUT": (4, 10),
+    "DOOR_OPEN_FAILED": (4, 10),
+    "DOOR_LEFT_OPEN": (30, 60),
+}
 
 
 def initialize_sequence() -> None:
@@ -39,56 +72,47 @@ def initialize_sequence() -> None:
 
 
 def reserve_journal_number() -> int:
-    # A write transaction reserves one number even when requests arrive together.
     with closing(sqlite3.connect(STATE_FILE, timeout=10)) as database, database:
         database.execute("UPDATE journal_sequence SET last_number = last_number + 1")
-        return database.execute("SELECT last_number FROM journal_sequence").fetchone()[0]
+        return database.execute(
+            "SELECT last_number FROM journal_sequence"
+        ).fetchone()[0]
 
 
-def event_count(scenario: tuple[str | None, ...]) -> int:
-    return sum(2 if outcome is None else 3 for outcome in scenario)
+def event_count(order: tuple[tuple[str, ...], ...]) -> int:
+    return sum(len(attempt) for attempt in order)
 
 
 def generate_log(journal_number: int) -> str:
     random = Random()
-    target = random.randint(40, 50)
-    orders = [(TIMEOUT, CONFIRMED), (None,), (CONFIRMED,)]
-    remaining = target - sum(map(event_count, orders))
+    orders = list(REQUIRED_ORDERS)
+    remaining = EVENTS_PER_JOURNAL - sum(map(event_count, orders))
 
-    while remaining:
-        choices = [
-            scenario for scenario in SCENARIOS
-            if event_count(scenario) <= remaining and remaining - event_count(scenario) != 1
-        ]
-        selected = random.choice(choices)
-        orders.append(selected)
-        remaining -= event_count(selected)
+    while remaining > 0:
+        candidates = [order for order in RANDOM_ORDERS if event_count(order) <= remaining]
+        order = random.choice(candidates)
+        orders.append(order)
+        remaining -= event_count(order)
 
     random.shuffle(orders)
     log_date = datetime.now(timezone.utc).date()
     start = datetime.combine(log_date, time(8)) + timedelta(minutes=random.randrange(600))
 
     lines = []
-    for order_index, outcomes in enumerate(orders, start=1):
-        # Fewer than 100 orders fit in one journal, so ranges never overlap.
-        order = f"A{journal_number * 100 + order_index:04d}"
-        started = start + timedelta(seconds=random.randint(0, 150))
-        for attempt, outcome in enumerate(outcomes, start=101):
-            command_sent = started + timedelta(seconds=random.randint(1, 3))
-            events = [
-                (started, "CODE_ACCEPTED"),
-                (command_sent, "OPEN_COMMAND_SENT"),
-            ]
-            if outcome is not None:
-                delay = random.randint(4, 10) if outcome == TIMEOUT else random.randint(1, 3)
-                finished = command_sent + timedelta(seconds=delay)
-                events.append((finished, outcome))
-                started = finished + timedelta(seconds=random.randint(3, 20))
+    for order_index, attempts in enumerate(orders, start=1):
+        order_number = f"A{journal_number * 100 + order_index:04d}"
+        moment = start + timedelta(seconds=random.randint(0, 150))
 
-            for timestamp, event in events:
-                lines.append(f"{timestamp.isoformat()}|{order}|{attempt}|{event}")
+        for attempt_number, events in enumerate(attempts, start=101):
+            for event_index, event in enumerate(events):
+                if event_index > 0:
+                    minimum, maximum = EVENT_DELAY_SECONDS.get(event, (1, 3))
+                    moment += timedelta(seconds=random.randint(minimum, maximum))
 
-    # Delivery order may differ from event time, as in the lesson examples.
+                lines.append(f"{moment.isoformat()}|{order_number}|{attempt_number}|{event}")
+
+            moment += timedelta(seconds=random.randint(3, 20))
+
     random.shuffle(lines)
     return "\n".join(lines) + "\n"
 
@@ -120,8 +144,10 @@ class LogRequestHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     initialize_sequence()
+
     with ThreadingHTTPServer(("0.0.0.0", PORT), LogRequestHandler) as server:
         print(f"Учебный журнал доступен на http://localhost:{PORT}/logs", flush=True)
+
         try:
             server.serve_forever()
         except KeyboardInterrupt:
